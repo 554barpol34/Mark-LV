@@ -1,0 +1,21 @@
+# JARVIS — install with:  pip install -r jarvis/requirements.txt
+PyQt6>=6.6,<7
+google-genai>=1.20,<3
+playwright>=1.40,<2
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+ddgs>=9,<10
+openpyxl>=3.1,<4
+sounddevice>=0.4,<1
+numpy>=1.24,<3
+edge-tts>=6.1
+pyttsx3>=2.90
+pynput>=1.7
+pyautogui
+pyperclip
+mss>=9,<11
+pillow>=10,<13
+psutil>=5.9,<8
+send2trash
+python-docx
+pdfplumber
