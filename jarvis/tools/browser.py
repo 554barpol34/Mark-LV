@@ -1,5 +1,6 @@
 """
-The browser: one Opera window that JARVIS drives, and nothing else.
+The browser: one window that JARVIS drives, and nothing else. Opera by
+default; Edge, Chrome or Brave only when the user names one.
 
 How it stays reliable
   * ONE window. JARVIS starts Opera once with its own profile (~/.jarvis/
@@ -84,50 +85,85 @@ _SNAPSHOT_JS = r"""
 """
 
 
-def _find_opera() -> str | None:
-    want = (config.get("browser") or "opera").lower()
-    custom = config.get("browser_path") or os.environ.get("JARVIS_BROWSER_EXE")
+# Where each browser installs itself on Windows (under LOCALAPPDATA / Program Files).
+_WIN_PATHS = {
+    "opera": [r"Programs\Opera\opera.exe", r"Opera\opera.exe"],
+    "operagx": [r"Programs\Opera GX\opera.exe", r"Opera GX\opera.exe"],
+    "edge": [r"Microsoft\Edge\Application\msedge.exe"],
+    "chrome": [r"Google\Chrome\Application\chrome.exe"],
+    "brave": [r"BraveSoftware\Brave-Browser\Application\brave.exe"],
+}
+_MAC_APPS = {"opera": "Opera", "operagx": "Opera GX", "edge": "Microsoft Edge",
+             "chrome": "Google Chrome", "brave": "Brave Browser"}
+_DISPLAY = {"opera": "Opera", "operagx": "Opera GX", "edge": "Edge", "chrome": "Chrome", "brave": "Brave"}
+_ALIASES = {"microsoft edge": "edge", "msedge": "edge", "google chrome": "chrome", "opera gx": "operagx",
+            "gx": "operagx"}
+
+
+def _norm(name: str) -> str:
+    n = (name or "").strip().lower()
+    return _ALIASES.get(n, n) if _ALIASES.get(n, n) in _WIN_PATHS else "opera"
+
+
+def _find_browser(name: str) -> str | None:
+    custom = os.environ.get("JARVIS_BROWSER_EXE") or (config.get("browser_path") if name == _norm(config.get("browser")) else "")
     if custom:
         return custom if Path(custom).exists() else None
-    if Path(want).exists():
-        return want
-    names = ["Opera GX", "Opera"] if want == "operagx" else ["Opera", "Opera GX"]
     if sys.platform == "win32":
         roots = [os.environ.get("LOCALAPPDATA", ""), os.environ.get("PROGRAMFILES", ""),
                  os.environ.get("PROGRAMFILES(X86)", "")]
-        for name in names:
+        for rel in _WIN_PATHS[name]:
             for root in roots:
-                for sub in (Path(root) / "Programs" / name, Path(root) / name):
-                    if (sub / "opera.exe").exists():
-                        return str(sub / "opera.exe")
+                if root and (Path(root) / rel).exists():
+                    return str(Path(root) / rel)
+        exe_name = Path(_WIN_PATHS[name][0]).name
         try:
             import winreg
             for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
                 try:
-                    with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\opera.exe") as k:
+                    with winreg.OpenKey(hive, rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}") as k:
                         exe = winreg.QueryValue(k, None).strip('"')
-                        if Path(exe).exists():
+                        if Path(exe).exists() and (name != "operagx" or "GX" in exe):
                             return exe
                 except OSError:
                     pass
         except ImportError:
             pass
     if sys.platform == "darwin":
-        for name in names:
-            p = Path(f"/Applications/{name}.app/Contents/MacOS/{name}")
-            if p.exists():
-                return str(p)
-    return shutil.which("opera")
+        app = _MAC_APPS[name]
+        p = Path(f"/Applications/{app}.app/Contents/MacOS/{app}")
+        if p.exists():
+            return str(p)
+    return shutil.which({"edge": "microsoft-edge", "chrome": "google-chrome"}.get(name, name))
 
 
 class Browser:
     def __init__(self):
+        self.name = _norm(config.get("browser"))
         self._pw = None
         self._browser = None
         self.page = None
         self._refs: dict[int, object] = {}     # number -> frame holding it
 
     # ── connection ────────────────────────────────────────────────────────
+    @property
+    def display(self) -> str:
+        return _DISPLAY.get(self.name, "Opera")
+
+    @property
+    def profile(self) -> Path:
+        # Each browser gets its own JARVIS profile; Opera keeps the original folder.
+        return PROFILE_DIR if self.name == "opera" else config.DATA_DIR / f"browser-profile-{self.name}"
+
+    def use(self, name: str) -> None:
+        """Switch browsers. The old window stays open; JARVIS just stops driving it."""
+        name = _norm(name)
+        if name != self.name:
+            self.name = name
+            self._browser = None
+            self.page = None
+            self._refs = {}
+
     def _alive(self) -> bool:
         try:
             return bool(self.page) and not self.page.is_closed() and self._browser.is_connected()
@@ -135,7 +171,7 @@ class Browser:
             return False
 
     def _port_file_port(self) -> int | None:
-        f = PROFILE_DIR / "DevToolsActivePort"
+        f = self.profile / "DevToolsActivePort"
         try:
             port = int(f.read_text().split()[0])
         except Exception:
@@ -191,17 +227,17 @@ class Browser:
         return self.page
 
     def _launch(self) -> int:
-        exe = _find_opera()
+        exe = _find_browser(self.name)
         if not exe:
             raise RuntimeError(
-                "Opera was not found. Install Opera, or put its full path in "
+                f"{self.display} was not found on this PC. Install it, or put its full path in "
                 f"{config.CONFIG_FILE} as \"browser_path\".")
-        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        self.profile.mkdir(parents=True, exist_ok=True)
         try:
-            (PROFILE_DIR / "DevToolsActivePort").unlink()
+            (self.profile / "DevToolsActivePort").unlink()
         except FileNotFoundError:
             pass
-        args = [exe, f"--user-data-dir={PROFILE_DIR}", "--remote-debugging-port=0",
+        args = [exe, f"--user-data-dir={self.profile}", "--remote-debugging-port=0",
                 "--no-first-run", "--no-default-browser-check",
                 "--autoplay-policy=no-user-gesture-required"]
         args += os.environ.get("JARVIS_BROWSER_ARGS", "").split()
@@ -214,8 +250,8 @@ class Browser:
             port = self._port_file_port()
             if port:
                 return port
-        raise RuntimeError("Opera started but did not open its control port. "
-                           "Close every JARVIS Opera window and try again.")
+        raise RuntimeError(f"{self.display} started but did not open its control port. "
+                           f"Close every JARVIS {self.display} window and try again.")
 
     def _on_new_page(self, page):
         # A link that opens in a new tab: follow it, like a person would.
@@ -407,22 +443,28 @@ BROWSER = Browser()
 
 
 def _label(verb):
-    return lambda a: f"Opera: {verb} {a.get('url') or a.get('text') or a.get('key') or a.get('ref') or ''}".strip()
+    return lambda a: f"{BROWSER.display}: {verb} {a.get('url') or a.get('text') or a.get('key') or a.get('ref') or ''}".strip()
 
 
-@tool("browser_open", """Open a web page in JARVIS's Opera window (a URL, a site name like
+@tool("browser_open", """Open a web page in JARVIS's browser window (a URL, a site name like
 sahibinden.com, or words to search on Google). Returns the page title and the numbered list of
-clickable things on screen.""",
-      {"url": {"type": "string", "description": "URL, domain, or search words"}}, ["url"],
-      label=_label("açılıyor:"))
-def browser_open(url: str):
+clickable things on screen. The browser is Opera unless the user names another one; then pass
+browser (it stays in use until changed). Never open browsers with run_command or open_app.""",
+      {"url": {"type": "string", "description": "URL, domain, or search words"},
+       "browser": {"type": "string", "enum": ["opera", "operagx", "edge", "chrome", "brave"],
+                   "description": "only when the user asked for a specific browser"}}, ["url"],
+      label=lambda a: (f"{_DISPLAY.get(_norm(a['browser']))}" if a.get("browser") else BROWSER.display)
+      + f": açılıyor: {a.get('url', '')}")
+def browser_open(url: str, browser: str = ""):
+    if browser:
+        BROWSER.use(browser)
     return BROWSER.open(url)
 
 
 @tool("browser_click", """Click an element by its number from the latest list, e.g. 12 for
 "[12] link: Emlak". Returns the updated list. If a cookie/consent banner is in the way, click its
 accept button first.""",
-      {"ref": {"type": "integer"}}, ["ref"], label=lambda a: f"Opera: [{a.get('ref')}] tıklanıyor")
+      {"ref": {"type": "integer"}}, ["ref"], label=lambda a: f"{BROWSER.display}: [{a.get('ref')}] tıklanıyor")
 def browser_click(ref: int):
     return BROWSER.click(ref)
 
@@ -430,14 +472,14 @@ def browser_click(ref: int):
 @tool("browser_type", "Type into an input box by its number. submit=true presses Enter afterwards.",
       {"ref": {"type": "integer"}, "text": {"type": "string"},
        "submit": {"type": "boolean"}}, ["ref", "text"],
-      label=lambda a: f"Opera: yazılıyor \"{str(a.get('text'))[:40]}\"")
+      label=lambda a: f"{BROWSER.display}: yazılıyor \"{str(a.get('text'))[:40]}\"")
 def browser_type(ref: int, text: str, submit: bool = False):
     return BROWSER.type(ref, text, submit)
 
 
 @tool("browser_select", "Choose an option in a dropdown by its number and the option's visible text.",
       {"ref": {"type": "integer"}, "option": {"type": "string"}}, ["ref", "option"],
-      label=lambda a: f"Opera: seçiliyor {a.get('option')}")
+      label=lambda a: f"{BROWSER.display}: seçiliyor {a.get('option')}")
 def browser_select(ref: int, option: str):
     return BROWSER.select(ref, option)
 
@@ -451,37 +493,37 @@ def browser_press(key: str):
 @tool("browser_scroll", "Scroll the page and return what is clickable afterwards.",
       {"direction": {"type": "string", "enum": ["down", "up"]},
        "screens": {"type": "number", "description": "how many screens, default 1"}},
-      label=lambda a: "Opera: sayfa kaydırılıyor")
+      label=lambda a: f"{BROWSER.display}: sayfa kaydırılıyor")
 def browser_scroll(direction: str = "down", screens: float = 1):
     return BROWSER.scroll(direction, screens)
 
 
 @tool("browser_elements", "List the clickable elements on screen again (refreshes the numbers).",
-      {"limit": {"type": "integer"}}, label=lambda a: "Opera: sayfaya bakılıyor")
+      {"limit": {"type": "integer"}}, label=lambda a: f"{BROWSER.display}: sayfaya bakılıyor")
 def browser_elements(limit: int = SNAPSHOT_LIMIT):
     return BROWSER.snapshot(limit)
 
 
 @tool("browser_read", """Read the text of the current page, to pull out data (prices, listings,
 articles). With find="word" only lines mentioning those words come back.""",
-      {"find": {"type": "string"}}, label=lambda a: "Opera: sayfa okunuyor")
+      {"find": {"type": "string"}}, label=lambda a: f"{BROWSER.display}: sayfa okunuyor")
 def browser_read(find: str = ""):
     return BROWSER.read(find)
 
 
 @tool("browser_tables", "Return the HTML tables on the current page as tab-separated rows.",
-      label=lambda a: "Opera: tablolar okunuyor")
+      label=lambda a: f"{BROWSER.display}: tablolar okunuyor")
 def browser_tables():
     return BROWSER.tables()
 
 
 @tool("browser_screenshot", """See the page as an image, when the element list is not enough to
-understand it (maps, images, odd layouts).""", label=lambda a: "Opera: ekran görüntüsü")
+understand it (maps, images, odd layouts).""", label=lambda a: f"{BROWSER.display}: ekran görüntüsü")
 def browser_screenshot():
     return BROWSER.screenshot()
 
 
-@tool("browser_back", "Go back to the previous page.", label=lambda a: "Opera: geri")
+@tool("browser_back", "Go back to the previous page.", label=lambda a: f"{BROWSER.display}: geri")
 def browser_back():
     return BROWSER.back()
 
@@ -489,6 +531,6 @@ def browser_back():
 @tool("browser_tabs", "List, switch to, open or close tabs. Tabs are numbered from 1.",
       {"action": {"type": "string", "enum": ["list", "switch", "new", "close"]},
        "index": {"type": "integer"}, "url": {"type": "string"}},
-      label=lambda a: "Opera: sekmeler")
+      label=lambda a: f"{BROWSER.display}: sekmeler")
 def browser_tabs(action: str = "list", index: int | None = None, url: str = ""):
     return BROWSER.tabs(action, index, url)

@@ -99,5 +99,5 @@ def call(name: str, args: dict, approve: Callable[[str, str], bool] | None = Non
 
 
 def load_all() -> dict[str, Tool]:
-    from jarvis.tools import browser, web, files, excel, system, media, memory  # noqa: F401
+    from jarvis.tools import browser, web, files, excel, capture, system, media, memory  # noqa: F401
     return REGISTRY
