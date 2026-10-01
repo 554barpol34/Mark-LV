@@ -1,3 +1,5 @@
+> **Yeni JARVIS:** `jarvis/` klasöründe sıfırdan yazılmış yeni asistan var. Çalıştırmak için `python -m jarvis` (ya da `JARVIS.bat`); ayrıntılar [jarvis/README.md](jarvis/README.md). Aşağısı eski Mark-LV'nin belgesi.
+
 # ⚙️ MARK LV (55)
 ### The Ultimate Cross-Platform Personal AI Assistant — By FatihMakes
 
