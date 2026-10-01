@@ -2258,6 +2258,9 @@ class JarvisLive:
                     or "NOT_FOUND" in str(e)
                 ):
                     print("[JARVIS] 🔗 Resumption handle rejected — starting a fresh session")
+                    # The same errors also mean other things (a bad tool schema, a
+                    # quota limit), so keep the real reason on the console.
+                    traceback.print_exc()
                     self.ui.write_log("SYS: Could not restore the conversation — starting fresh.")
                     self._resume_handle = None
                     self._conn_backoff = 0

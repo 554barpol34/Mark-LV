@@ -89,7 +89,18 @@ JARVIS hands the goal to `actions/agent_task.py`, which works on it in the backg
 3. **Look** at the screen when it needs to check what happened, then plan again from what it actually sees.
 4. **Report** in one or two sentences when the goal is done, blocked, or needs your input.
 
-Every step appears in the activity log and the step list stays on the content panel. Say **"stop"** at any time to cancel it, or ask how far it is.
+### ☰ The task window
+
+Click **☰** in the header (or just start a task) and the face makes way for the task window:
+
+* **Type a goal** and press RUN — no microphone needed. Asking by voice works too and opens the same window.
+* **Watch it work**: every step shows the tool it used, *why* it chose it, and what came back, with the step being planned at the bottom.
+* **STOP** is always one click away while a task runs.
+* **The result** appears underneath when it ends — with the path of anything it saved.
+* **RECENT** keeps your last 30 tasks (`memory/agent_history.json`, git-ignored); click one to see its steps again.
+* **📁 WORKSPACE** opens the folder where tasks save their files: `Documents/JARVIS` by default, or set `"agent_workspace"` in `config/api_keys.json`.
+
+Say **"stop"** at any time to cancel a task by voice, or ask how far it is.
 
 It is bounded on purpose: 15 steps by default (40 at most), 15 minutes, one run at a time, and it stops itself if it repeats the same step three times. It acts only through the existing tools, so their safety still holds: irreversible actions wait for **CONFIRM** on the HUD, file and settings changes can be undone, and sending a message on your behalf always waits for your CONFIRM first.
 

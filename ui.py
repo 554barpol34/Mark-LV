@@ -54,6 +54,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QListWidget, QListWidgetItem,
 )
 
 try:
@@ -2939,6 +2940,274 @@ class RemoteKeyOverlay(QWidget):
         self.closed.emit()
 
 
+class TaskPanel(QWidget):
+    """The task window: agent mode as something you can see and steer.
+
+    Voice is good for "turn the volume down" and poor for "research three
+    laptops and put the comparison in a file": you cannot see the plan, you
+    cannot tell how far it has got, and stopping it means talking over it. This
+    page puts that work on screen, the way a coworking assistant does:
+
+        type a goal  ->  watch each step and why it was taken  ->  read the result
+
+    with STOP always one click away and the last runs kept underneath. It does
+    not plan anything itself — actions/agent_task.py does — it only starts runs
+    and draws the snapshots that module publishes.
+    """
+
+    start_requested = pyqtSignal(str)
+    stop_requested = pyqtSignal()
+
+    _STATE_COL = {"running": "PRI", "done": "GREEN", "failed": "RED", "stopped": "ACC2"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TaskPanel")
+        self.setStyleSheet(f"QWidget#TaskPanel {{ background: {C.BG}; }}")
+        self._runs: dict[str, dict] = {}     # id -> latest snapshot
+        self._live_id = ""
+        self._shown_id = ""
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+
+        # ── header ───────────────────────────────────────────────────────────
+        hdr = QHBoxLayout(); hdr.setSpacing(6)
+        title = QLabel("◈  TASKS")
+        title.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 1px;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        self._ws_btn = self._small_btn("📁  WORKSPACE")
+        self._ws_btn.setToolTip("Open the folder where tasks save their files")
+        self._ws_btn.clicked.connect(self._open_workspace)
+        hdr.addWidget(self._ws_btn)
+        lay.addLayout(hdr)
+
+        # ── goal input ───────────────────────────────────────────────────────
+        row = QHBoxLayout(); row.setSpacing(5)
+        self._goal_in = QLineEdit()
+        self._goal_in.setPlaceholderText(
+            "Describe a task — e.g. find the 3 cheapest flights to Berlin next "
+            "Friday and save them in a note")
+        self._goal_in.setFont(QFont("Courier New", 9))
+        self._goal_in.setFixedHeight(32)
+        self._goal_in.setStyleSheet(f"""
+            QLineEdit {{
+                background: {C.DARK}; color: {C.WHITE};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 8px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
+        """)
+        self._goal_in.returnPressed.connect(self._on_run)
+        row.addWidget(self._goal_in)
+        self._run_btn = QPushButton("▸  RUN")
+        self._run_btn.setFixedHeight(32)
+        self._run_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._run_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL}; color: {C.PRI};
+                border: 1px solid {C.PRI_DIM}; border-radius: 3px; padding: 0 12px;
+            }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; border: 1px solid {C.PRI}; }}
+            QPushButton:disabled {{ color: {C.TEXT_DIM}; border-color: {C.BORDER}; }}
+        """)
+        self._run_btn.clicked.connect(self._on_run)
+        row.addWidget(self._run_btn)
+        lay.addLayout(row)
+
+        # ── current run ──────────────────────────────────────────────────────
+        st = QHBoxLayout(); st.setSpacing(8)
+        self._state_lbl = QLabel("IDLE")
+        self._state_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._state_lbl.setFixedWidth(84)
+        st.addWidget(self._state_lbl)
+        self._goal_lbl = QLabel("No task yet. Type one above, or ask by voice.")
+        self._goal_lbl.setWordWrap(True)
+        self._goal_lbl.setFont(QFont("Courier New", 9))
+        self._goal_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
+        st.addWidget(self._goal_lbl, stretch=1)
+        self._stop_btn = self._small_btn("■  STOP")
+        self._stop_btn.setStyleSheet(self._stop_btn.styleSheet().replace(C.TEXT_DIM, C.RED))
+        self._stop_btn.clicked.connect(self.stop_requested.emit)
+        self._stop_btn.hide()
+        st.addWidget(self._stop_btn)
+        lay.addLayout(st)
+        self._set_state("idle")
+
+        self._steps = QListWidget()
+        self._steps.setWordWrap(True)
+        self._steps.setFont(QFont("Courier New", 8))
+        self._steps.setStyleSheet(self._list_style())
+        self._steps.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        lay.addWidget(self._steps, stretch=3)
+
+        self._result = QTextEdit()
+        self._result.setReadOnly(True)
+        self._result.setFont(QFont("Courier New", 9))
+        self._result.setMaximumHeight(110)
+        self._result.setStyleSheet(f"""
+            QTextEdit {{
+                background: {C.DARK}; color: {C.WHITE};
+                border: 1px solid {C.BORDER_B}; border-radius: 3px; padding: 4px;
+            }}
+        """)
+        self._result.hide()
+        lay.addWidget(self._result, stretch=1)
+
+        # ── recent runs ──────────────────────────────────────────────────────
+        rec = QLabel("RECENT")
+        rec.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        rec.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; letter-spacing: 1px;")
+        lay.addWidget(rec)
+        self._recent = QListWidget()
+        self._recent.setFont(QFont("Courier New", 8))
+        self._recent.setMaximumHeight(96)
+        self._recent.setStyleSheet(self._list_style())
+        self._recent.itemClicked.connect(self._on_recent_clicked)
+        lay.addWidget(self._recent)
+        self._load_history()
+
+    # ── styling helpers ──────────────────────────────────────────────────────
+    @staticmethod
+    def _small_btn(text: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        b.setFixedHeight(22)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setStyleSheet(f"""
+            QPushButton {{
+                color: {C.TEXT_DIM}; background: transparent;
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 0 8px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
+        """)
+        return b
+
+    @staticmethod
+    def _list_style() -> str:
+        return f"""
+            QListWidget {{
+                background: {C.DARK}; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px;
+            }}
+            QListWidget::item {{ padding: 4px 4px; border-bottom: 1px solid {C.PANEL2}; }}
+            QListWidget::item:selected {{ background: {C.PRI_GHO}; color: {C.WHITE}; }}
+        """
+
+    def _set_state(self, state: str) -> None:
+        col = getattr(C, self._STATE_COL.get(state, "TEXT_DIM"))
+        self._state_lbl.setText(f"● {state.upper()}")
+        self._state_lbl.setStyleSheet(f"color: {col}; background: transparent;")
+
+    # ── actions ──────────────────────────────────────────────────────────────
+    def _on_run(self) -> None:
+        goal = self._goal_in.text().strip()
+        if not goal or self._live_id:
+            return
+        self._goal_in.clear()
+        self.start_requested.emit(goal)
+
+    def show_notice(self, text: str) -> None:
+        """A start that was refused (no dispatcher yet, already busy)."""
+        self._result.setPlainText(text)
+        self._result.show()
+
+    def _open_workspace(self) -> None:
+        try:
+            from actions.agent_task import workspace
+            from PyQt6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(workspace())))
+        except Exception as e:
+            self.show_notice(f"Could not open the workspace: {e}")
+
+    def _load_history(self) -> None:
+        try:
+            from actions.agent_task import history
+            runs = history()
+        except Exception:
+            runs = []
+        for r in runs:
+            self._runs[r.get("id", "")] = r
+        self._refresh_recent()
+
+    def _refresh_recent(self) -> None:
+        self._recent.clear()
+        done = [r for r in self._runs.values() if r.get("state") != "running"]
+        done.sort(key=lambda r: r.get("started_at", ""), reverse=True)
+        icons = {"done": "✓", "failed": "✗", "stopped": "■"}
+        for r in done[:30]:
+            when = (r.get("started_at") or "")[5:16].replace("T", " ")
+            it = QListWidgetItem(f"{icons.get(r.get('state'), '·')}  {when}   {r.get('goal', '')}")
+            it.setData(Qt.ItemDataRole.UserRole, r.get("id"))
+            it.setToolTip(r.get("outcome", ""))
+            self._recent.addItem(it)
+
+    def _on_recent_clicked(self, item) -> None:
+        rid = item.data(Qt.ItemDataRole.UserRole)
+        if rid in self._runs:
+            self._shown_id = rid
+            self._render(self._runs[rid])
+
+    # ── updates from the agent (already on the Qt thread) ───────────────────
+    def apply(self, snap: dict) -> None:
+        rid = snap.get("id", "")
+        self._runs[rid] = snap
+        running = snap.get("state") == "running"
+        if running:
+            if self._live_id != rid:
+                self._shown_id = rid          # a new run takes the page
+            self._live_id = rid
+        elif self._live_id == rid:
+            self._live_id = ""
+            self._refresh_recent()
+        self._run_btn.setEnabled(not self._live_id)
+        self._stop_btn.setVisible(bool(self._live_id))
+        if self._shown_id in ("", rid):
+            self._shown_id = rid
+            self._render(snap)
+
+    def _render(self, snap: dict) -> None:
+        state = snap.get("state", "idle")
+        self._set_state(state)
+        self._goal_lbl.setText(snap.get("goal", ""))
+        steps = snap.get("steps") or []
+        self._steps.clear()
+        for s in steps:
+            result = str(s.get("result") or "")
+            low = result.lower()
+            if not result:
+                icon = "◌"                                   # in progress
+            elif "failed" in low or "not done" in low or "error" in low:
+                icon = "✗"
+            else:
+                icon = "✓"
+            args = json.dumps(s.get("args") or {}, ensure_ascii=False)
+            args = args if len(args) <= 90 else args[:89] + "…"
+            lines = [f"{icon} {s.get('n')}. {s.get('action')}  {args if args != '{}' else ''}"]
+            if s.get("thought"):
+                lines.append(f"     {s['thought']}")
+            if result:
+                short = " ".join(result.split())
+                lines.append(f"     → {short[:160]}{'…' if len(short) > 160 else ''}")
+            it = QListWidgetItem("\n".join(lines))
+            it.setToolTip(result[:2000])
+            self._steps.addItem(it)
+        if state == "running":
+            more = len(steps) + 1
+            wait = QListWidgetItem(f"◌ {more}. planning…")
+            wait.setForeground(qcol(C.TEXT_DIM))
+            self._steps.addItem(wait)
+        self._steps.scrollToBottom()
+        if state != "running" and snap.get("outcome"):
+            self._result.setPlainText(snap["outcome"])
+            self._result.show()
+        else:
+            self._result.hide()
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -2958,6 +3227,7 @@ class MainWindow(QMainWindow):
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
+    _agent_sig      = pyqtSignal(object)     # agent-mode run snapshot (dict)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -3174,11 +3444,19 @@ class MainWindow(QMainWindow):
             _miss.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
             _vid_v.addWidget(_miss, stretch=1)
 
-        # Stack: 0 = animated HUD, 1 = live camera, 2 = video
+        # The task window shares the stack too: it is the other thing that
+        # deserves the centre of the screen while it is working.
+        self._task_panel = TaskPanel()
+        self._task_panel.start_requested.connect(self._start_task)
+        self._task_panel.stop_requested.connect(self._stop_task)
+        self._player = None        # the JarvisUI facade, set by JarvisUI
+
+        # Stack: 0 = animated HUD, 1 = live camera, 2 = video, 3 = tasks
         self._hud_cam_stack = QStackedWidget()
         self._hud_cam_stack.addWidget(self.hud)
         self._hud_cam_stack.addWidget(_cam_cont)
         self._hud_cam_stack.addWidget(self._video_cont)
+        self._hud_cam_stack.addWidget(self._task_panel)
 
         self._center_split = QSplitter(Qt.Orientation.Vertical)
         self._center_split.setStyleSheet(f"""
@@ -3238,6 +3516,12 @@ class MainWindow(QMainWindow):
         self._video_mute_sig.connect(self._on_video_mute)
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._wake_dl_sig.connect(self._on_wake_install_done)
+        self._agent_sig.connect(self._on_agent_update)
+        try:
+            from actions import agent_task as _agent
+            _agent.add_listener(self._agent_sig.emit)
+        except Exception as e:
+            print(f"[Tasks] agent mode unavailable: {e}")
         self._quiz_sig.connect(self._show_quiz)
         self._quiz_hide_sig.connect(self._hide_quiz)
         self._review_sig.connect(self._show_review)
@@ -3979,6 +4263,18 @@ class MainWindow(QMainWindow):
         self._ctrl_btn.clicked.connect(self._toggle_controls)
         lay.addSpacing(4)
         lay.addWidget(self._ctrl_btn)
+
+        # The task window: agent mode's steps on screen instead of the face.
+        self._tasks_btn = QPushButton("☰")
+        self._tasks_btn.setFixedSize(26, 26)
+        self._tasks_btn.setFont(QFont("Courier New", 11))
+        self._tasks_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tasks_btn.setToolTip("Tasks — give JARVIS a goal and watch it work")
+        self._tasks_btn.setStyleSheet(self._drawer_btn.styleSheet())
+        self._tasks_btn.setCheckable(True)
+        self._tasks_btn.clicked.connect(self._toggle_tasks)
+        lay.addSpacing(4)
+        lay.addWidget(self._tasks_btn)
         lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
@@ -5413,6 +5709,47 @@ class MainWindow(QMainWindow):
 
     # ── Irreversible-action confirmation ─────────────────────────────────────
 
+    # ── Task window ──────────────────────────────────────────────────────────
+    def _show_tasks(self, show: bool) -> None:
+        # Camera and video own the centre while they are on; the task page
+        # only swaps with the face.
+        idx = self._hud_cam_stack.currentIndex()
+        if show and idx in (0, 3):
+            self._hud_cam_stack.setCurrentIndex(3)
+        elif not show and idx == 3:
+            self._hud_cam_stack.setCurrentIndex(0)
+        self._tasks_btn.setChecked(self._hud_cam_stack.currentIndex() == 3)
+
+    def _toggle_tasks(self) -> None:
+        self._show_tasks(self._hud_cam_stack.currentIndex() != 3)
+        if self._hud_cam_stack.currentIndex() == 3:
+            self._task_panel._goal_in.setFocus()
+
+    def _start_task(self, goal: str) -> None:
+        try:
+            from actions import agent_task as _agent
+            reply = _agent.agent_task({"goal": goal}, player=self._player)
+        except Exception as e:
+            reply = f"Agent mode failed to start: {e}"
+        if "[AGENT_STARTED]" not in reply:
+            self._task_panel.show_notice(reply)
+
+    def _stop_task(self) -> None:
+        try:
+            from actions import agent_task as _agent
+            _agent.agent_task({"action": "stop"})
+        except Exception as e:
+            self._task_panel.show_notice(f"Could not stop: {e}")
+
+    def _on_agent_update(self, snap) -> None:
+        if not isinstance(snap, dict):
+            return
+        is_new = (snap.get("state") == "running"
+                  and snap.get("id") != self._task_panel._live_id)
+        self._task_panel.apply(snap)
+        if is_new:
+            self._show_tasks(True)      # a task started, by voice or typing
+
     def _show_confirm_banner(self, title: str, detail: str):
         self._hide_confirm_banner()
         ov = ConfirmBanner(title, detail, parent=self.centralWidget())
@@ -5601,6 +5938,7 @@ class JarvisUI:
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
+        self._win._player = self       # the task window starts runs as this UI
         self.root = _RootShim(self._app)
         self._win.show()
 
