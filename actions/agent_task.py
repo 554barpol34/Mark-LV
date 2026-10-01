@@ -47,10 +47,25 @@ pretending.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
+
+if getattr(sys, "frozen", False):
+    _BASE = Path(sys.executable).parent
+else:
+    _BASE = Path(__file__).resolve().parent.parent
+
+_CONFIG_FILE = _BASE / "config" / "api_keys.json"
+# Finished runs, newest first, so the task window can show what was done before.
+# Personal data, so it is git-ignored alongside the long-term memory.
+_HISTORY_FILE = _BASE / "memory" / "agent_history.json"
+HISTORY_KEEP = 30
 
 # ── Limits ────────────────────────────────────────────────────────────────────
 DEFAULT_STEPS = 15
@@ -124,7 +139,10 @@ Rules:
 - When a result says a confirmation is waiting on screen, the user decides; do
   not try to work around it.
 - Write tool arguments in the form the tool expects (English action names,
-  real paths). The summary should be in the language of the goal."""
+  real paths). The summary should be in the language of the goal.
+- Files you create go in the WORKSPACE folder given with the goal, unless the
+  goal names another place. Mention the full path of anything you created in
+  the summary."""
 
 
 @dataclass
@@ -140,6 +158,9 @@ class _Step:
 class _Run:
     goal: str
     max_steps: int
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    started_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    finished_at: str = ""
     started: float = field(default_factory=time.monotonic)
     steps: list[_Step] = field(default_factory=list)
     cancel: threading.Event = field(default_factory=threading.Event)
@@ -151,6 +172,9 @@ _run_tool: Optional[Callable[[str, dict], str]] = None
 _catalogue: Optional[Callable[[], list[dict]]] = None
 _current: Optional[_Run] = None
 _lock = threading.Lock()
+# Called with a snapshot dict whenever a run starts, takes a step, gets a result
+# or ends. The task window subscribes here; it marshals onto the Qt thread itself.
+_listeners: list[Callable[[dict], None]] = []
 
 
 def bind(run_tool: Callable[[str, dict], str],
@@ -161,6 +185,68 @@ def bind(run_tool: Callable[[str, dict], str],
     tools() -> list of function declarations the agent may choose from."""
     global _run_tool, _catalogue
     _run_tool, _catalogue = run_tool, tools
+
+
+def add_listener(fn: Callable[[dict], None]) -> None:
+    """Subscribe to run updates. fn(snapshot) is called from the agent thread."""
+    if fn not in _listeners:
+        _listeners.append(fn)
+
+
+def workspace() -> Path:
+    """Where the agent saves what it makes: config key "agent_workspace", else
+    Documents/JARVIS. Created on first use."""
+    path = ""
+    try:
+        path = str(json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
+                   .get("agent_workspace") or "").strip()
+    except Exception:
+        pass
+    if path:
+        ws = Path(path).expanduser()
+    else:
+        docs = Path.home() / "Documents"
+        ws = (docs if docs.is_dir() else Path.home()) / "JARVIS"
+    try:
+        ws.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[Agent] could not create workspace {ws}: {e}")
+    return ws
+
+
+def snapshot(run: "_Run") -> dict:
+    """A plain-data copy of a run, safe to hand to another thread or to disk."""
+    return {
+        "id": run.id, "goal": run.goal, "state": run.state, "outcome": run.outcome,
+        "max_steps": run.max_steps, "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "steps": [{"n": s.n, "thought": s.thought, "action": s.action,
+                   "args": dict(s.args), "result": s.result} for s in run.steps],
+    }
+
+
+def current() -> Optional[dict]:
+    with _lock:
+        return snapshot(_current) if _current is not None else None
+
+
+def history() -> list[dict]:
+    """Finished runs, newest first. [] when there are none or the file is unreadable."""
+    try:
+        data = json.loads(_HISTORY_FILE.read_text(encoding="utf-8"))
+        return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_history(run: "_Run") -> None:
+    try:
+        runs = [snapshot(run)] + [r for r in history() if r.get("id") != run.id]
+        _HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _HISTORY_FILE.write_text(json.dumps(runs[:HISTORY_KEEP], ensure_ascii=False, indent=1),
+                                 encoding="utf-8")
+    except Exception as e:
+        print(f"[Agent] could not save history: {e}")
 
 
 # ── Small helpers ─────────────────────────────────────────────────────────────
@@ -183,7 +269,16 @@ def _say(player, instruction: str) -> None:
 
 
 def _panel(player, run: _Run) -> None:
-    """Keep the step list on the content panel while the run is going."""
+    """Tell the task window what changed. Without one (an older UI, tests), keep
+    the step list on the content panel instead."""
+    if _listeners:
+        snap = snapshot(run)
+        for fn in list(_listeners):
+            try:
+                fn(snap)
+            except Exception as e:
+                print(f"[Agent] listener failed: {e}")
+        return
     if player is None or not hasattr(player, "show_content"):
         return
     lines = [f"GOAL: {run.goal}", ""]
@@ -262,7 +357,8 @@ def _plan(run: _Run, tools_text: str, image) -> Optional[dict]:
 
     elapsed = int(time.monotonic() - run.started)
     prompt = (
-        f"GOAL: {run.goal}\n\n"
+        f"GOAL: {run.goal}\n"
+        f"WORKSPACE: {workspace()}\n\n"
         f"TOOLS:\n{tools_text}\n- look / wait / finish / ask_user (see rules)\n\n"
         f"STEPS SO FAR:\n{_history(run)}\n\n"
         f"This is step {len(run.steps) + 1} of at most {run.max_steps}; "
@@ -385,6 +481,7 @@ def _execute(run: _Run, player) -> None:
                   action=action, args=args)
         run.steps.append(s)
         _log(player, f"step {s.n}: {action} {_one_line(json.dumps(args, ensure_ascii=False), 90)}")
+        _panel(player, run)
 
         if action == "finish":
             s.result = "finished"
@@ -452,16 +549,18 @@ def _worker(run: _Run, player) -> None:
         import traceback
         traceback.print_exc()
 
+    run.finished_at = datetime.now().isoformat(timespec="seconds")
     _log(player, f"{run.state} after {len(run.steps)} steps — {_one_line(run.outcome, 160)}")
+    with _lock:
+        if _current is run:
+            _current = None
+    _save_history(run)
     _panel(player, run)
     if run.state != "stopped" or run.outcome.startswith("Needs your input"):
         _say(player,
              f"[AGENT_{run.state.upper()}] Agent mode has ended for the goal "
              f"'{run.goal}'. Report this to the user in one or two sentences, in "
              f"their own language, using only these facts: {run.outcome}")
-    with _lock:
-        if _current is run:
-            _current = None
 
 
 # ── Tool entry point ──────────────────────────────────────────────────────────
