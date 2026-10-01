@@ -123,6 +123,8 @@ Rules:
   over mouse and keyboard; use screen-level control only when nothing more
   direct exists, and look first.
 - Never invent results. Only report what a tool actually returned.
+- For browser_control, leave out 'browser' unless the user named one; their
+  default browser is then used.
 - Use the tool made for the subject when one exists (weather_report for
   weather, file_controller for files) before searching the web.
 - Search results are leads, not answers. A list of titles, snippets or links
