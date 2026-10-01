@@ -64,6 +64,15 @@ def _get_api_key() -> str:
 
 def _open_url(url: str) -> None:
     try:
+        from actions.browser_control import open_url
+        open_url(url)
+        return
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[YouTube] ⚠️ open_url failed: {e}")
+        return
+    try:
         if is_mac():
             subprocess.Popen(["open", url])
         elif is_linux():

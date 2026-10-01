@@ -259,15 +259,49 @@ def _chromium_exe(browser_name: str, spec: dict | None) -> Optional[str]:
 _CDP_ONLY = {"opera", "operagx"}
 
 
-def _preferred_browser() -> str:
-    """config/api_keys.json "preferred_browser", e.g. "opera". '' when unset."""
+def _config() -> dict:
     try:
         import json
         base = Path(__file__).resolve().parent.parent
-        cfg = json.loads((base / "config" / "api_keys.json").read_text(encoding="utf-8"))
-        return str(cfg.get("preferred_browser") or "").strip().lower()
+        return json.loads((base / "config" / "api_keys.json").read_text(encoding="utf-8"))
     except Exception:
+        return {}
+
+
+def _preferred_browser() -> str:
+    """config/api_keys.json "preferred_browser", e.g. "opera". '' when unset."""
+    return str(_config().get("preferred_browser") or "").strip().lower()
+
+
+# The only browser JARVIS may open or drive. Everything that would open a web
+# page — navigation, automation, open_app("chrome"), a fallback link from
+# another skill — goes to this browser and nothing else. Set "browser_only" in
+# config/api_keys.json to another browser name, or to "" / "any" to allow all.
+DEFAULT_ONLY_BROWSER = "opera"
+
+
+def only_browser() -> str:
+    cfg = _config()
+    val = cfg.get("browser_only", DEFAULT_ONLY_BROWSER)
+    val = str(val or "").strip().lower()
+    if val in ("", "any", "all", "none"):
         return ""
+    return _ALIASES.get(val, val)
+
+
+# Things people call a browser. open_app sends these to the allowed browser.
+BROWSER_WORDS = {
+    "browser", "web browser", "internet", "tarayıcı", "tarayici",
+    "chrome", "google chrome", "edge", "microsoft edge", "msedge",
+    "firefox", "mozilla firefox", "safari", "brave", "vivaldi",
+    "internet explorer", "opera", "opera gx", "operagx",
+}
+
+
+def open_url(url: str = "") -> str:
+    """Open a page for the user, in the allowed browser. For other skills that
+    used to call webbrowser.open (which picks the system default, e.g. Edge)."""
+    return _open_native(url, None)
 
 
 _BROWSER_SPECS: dict[str, dict] = {
@@ -437,7 +471,10 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
         url = ""
 
     name = None
-    if browser_name:
+    locked = only_browser()
+    if locked:
+        name = locked
+    elif browser_name:
         name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
     elif not url:
         # No URL → only a window will open; needs the default browser's exe
@@ -471,6 +508,10 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
                 return f"Opened in {name}: {url}" if url else f"Opened {name}."
             except Exception as e:
                 print(f"[Browser] Native launch failed for {name}: {e}")
+        if locked:
+            # Never fall through to the system default: that is how Edge opened.
+            return (f"{_MAC_APP_NAMES.get(name, name)} could not be opened, and it is "
+                    f"the only browser JARVIS is allowed to use.")
         print(f"[Browser] '{name}' not found — falling back to default browser.")
 
     if not url:
@@ -1051,6 +1092,7 @@ class _SessionRegistry:
             return self._sessions[browser_name]
 
     def get(self, browser_name: str | None = None) -> _BrowserSession:
+        browser_name = only_browser() or browser_name
         if not browser_name:
             browser_name = (self._active_browser or _preferred_browser()
                             or _detect_default_browser())
@@ -1061,6 +1103,9 @@ class _SessionRegistry:
 
     def switch(self, browser_name: str) -> str:
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+        locked = only_browser()
+        if locked and browser_name != locked:
+            return f"Only {_MAC_APP_NAMES.get(locked, locked)} is enabled; staying on it."
         self._get_or_create(browser_name)
         self._active_browser = browser_name
         return f"Active browser → {browser_name}"
@@ -1110,6 +1155,8 @@ def browser_control(
     params  = parameters or {}
     action  = params.get("action", "").lower().strip()
     browser = params.get("browser", "").lower().strip() or None
+    if only_browser() and action not in ("switch",):
+        browser = only_browser()       # every other browser is switched off
     result  = "Unknown action."
 
     if action == "switch":
@@ -1251,7 +1298,7 @@ TOOL = {
             },
             "browser": {
                 "type": "STRING",
-                "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."
+                "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser. While only one browser is enabled (Opera, by default) this is ignored and that browser is used."
             },
             "url": {
                 "type": "STRING",
