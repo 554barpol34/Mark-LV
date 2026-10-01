@@ -117,7 +117,11 @@ def _open_app(app_name: str) -> bool:
 def _open_browser_url(url: str) -> bool:
     import webbrowser
     try:
-        webbrowser.open(url)
+        try:
+            from actions.browser_control import open_url
+            open_url(url)
+        except ImportError:
+            webbrowser.open(url)
         time.sleep(4.0) 
         return True
     except Exception as e:

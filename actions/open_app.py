@@ -252,6 +252,20 @@ def open_app(
     if launcher is None:
         return f"Unsupported operating system: {_SYSTEM}"
 
+    # Browsers: only the one JARVIS is allowed to use ever opens. A website
+    # named as an "app" opens there too, rather than in the system default.
+    try:
+        from actions.browser_control import BROWSER_WORDS, only_browser, open_url
+        key = app_name.lower().strip()
+        looks_like_site = ("." in key and " " not in key) or key.startswith("http")
+        if only_browser() and (key in BROWSER_WORDS or looks_like_site):
+            result = open_url(app_name if looks_like_site else "")
+            if player:
+                player.write_log(f"[open_app] {app_name} → {only_browser()}")
+            return result
+    except Exception as e:
+        print(f"[open_app] browser routing unavailable: {e}")
+
     normalized = _normalize(app_name)
     print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
 

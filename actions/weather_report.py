@@ -99,10 +99,19 @@ def _format(data: dict, day: str) -> str:
     return "\n".join(lines)
 
 
+def _open(url: str) -> None:
+    """In the browser JARVIS is allowed to use, not the system default."""
+    try:
+        from actions.browser_control import open_url
+        open_url(url)
+    except Exception:
+        webbrowser.open(url)
+
+
 def _open_in_browser(city: str, day: str, reason: str, player) -> str:
     query = f"weather in {city} {day}"
     try:
-        webbrowser.open(f"https://www.google.com/search?q={quote_plus(query)}")
+        _open(f"https://www.google.com/search?q={quote_plus(query)}")
         msg = (f"I could not fetch the weather data ({reason}), so I opened the "
                f"weather for {city} in the browser instead. I do not have the numbers.")
     except Exception as e:
