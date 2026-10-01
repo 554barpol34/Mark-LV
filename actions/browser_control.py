@@ -8,6 +8,7 @@ import platform
 import shutil
 import subprocess
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Optional
@@ -213,6 +214,61 @@ def _find_exe_windows(prog_name: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+def _chromium_exe(browser_name: str, spec: dict | None) -> Optional[str]:
+    """The browser's own executable, for launching it ourselves.
+
+    Playwright's `channel` route finds Chrome and Edge without a path, so the
+    spec often has none; the debugging-port route below needs one."""
+    if spec and spec.get("exe"):
+        return spec["exe"]
+    if _OS == "Windows":
+        local  = os.environ.get("LOCALAPPDATA", "")
+        prog   = os.environ.get("PROGRAMFILES", "")
+        prog86 = os.environ.get("PROGRAMFILES(X86)", "")
+        known = {
+            "chrome": [Path(prog) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                       Path(prog86) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                       Path(local) / "Google" / "Chrome" / "Application" / "chrome.exe"],
+            "edge":   [Path(prog86) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+                       Path(prog) / "Microsoft" / "Edge" / "Application" / "msedge.exe"],
+            "brave":  [Path(prog) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+                       Path(local) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe"],
+        }
+        for p in known.get(browser_name, []):
+            if p.exists():
+                return str(p)
+        if browser_name in ("opera", "operagx"):
+            return _find_opera_windows()
+        return _find_exe_windows({"edge": "msedge"}.get(browser_name, browser_name))
+    bins = {"chrome": ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"],
+            "edge": ["microsoft-edge", "microsoft-edge-stable"],
+            "opera": ["opera", "opera-stable"], "operagx": ["opera"],
+            "brave": ["brave-browser", "brave"], "vivaldi": ["vivaldi-stable", "vivaldi"]}
+    for b in bins.get(browser_name, []):
+        found = shutil.which(b)
+        if found:
+            return found
+    return None
+
+
+# Browsers Playwright cannot start directly. Opera's opera.exe is a launcher: it
+# starts the real browser and exits, so Playwright sees its browser "close" at
+# once ("Target page, context or browser has been closed"). These are always
+# started by us with a debugging port and attached to instead.
+_CDP_ONLY = {"opera", "operagx"}
+
+
+def _preferred_browser() -> str:
+    """config/api_keys.json "preferred_browser", e.g. "opera". '' when unset."""
+    try:
+        import json
+        base = Path(__file__).resolve().parent.parent
+        cfg = json.loads((base / "config" / "api_keys.json").read_text(encoding="utf-8"))
+        return str(cfg.get("preferred_browser") or "").strip().lower()
+    except Exception:
+        return ""
+
 
 _BROWSER_SPECS: dict[str, dict] = {
     "Windows": {
@@ -458,6 +514,8 @@ class _BrowserSession:
         self._pw:      Playwright     | None = None
         self._context: BrowserContext | None = None
         self._page:    Page           | None = None
+        self._browser = None                     # set only on the debugging-port route
+        self._proc:    subprocess.Popen | None = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -491,11 +549,29 @@ class _BrowserSession:
             asyncio.run_coroutine_threadsafe(self._async_close(), self._loop).result(10)
 
     async def _async_close(self):
-        if self._context:
+        if self._browser:
+            # Attached over a debugging port, close() only disconnects; ask the
+            # browser itself to quit so "close the browser" really does.
+            try:
+                cdp = await self._browser.new_browser_cdp_session()
+                await cdp.send("Browser.close")
+            except Exception as e:
+                print(f"[Browser] could not ask {self.browser_name} to quit: {e}")
+        elif self._context:
             try:
                 await self._context.close()
             except Exception:
                 pass
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        self._browser = self._proc = None
         if self._pw:
             try:
                 await self._pw.stop()
@@ -512,6 +588,82 @@ class _BrowserSession:
         await asyncio.sleep(0.3)
         pages = self._context.pages
         return pages[0] if pages else await self._context.new_page()
+
+    def _forget(self, *_):
+        """The window was closed (by the user, or the browser handed off to an
+        instance already running). Drop it so the next action starts a fresh one
+        instead of failing with "Target page, context or browser has been closed"
+        on every call after."""
+        self._context = self._page = self._browser = None
+
+    def _watch(self) -> None:
+        try:
+            self._context.on("close", self._forget)
+        except Exception:
+            pass
+        if self._browser is not None:
+            try:
+                self._browser.on("disconnected", self._forget)
+            except Exception:
+                pass
+
+    async def _launch_over_cdp(self, exe: str, profile: str, args: list[str]) -> None:
+        """Start the browser ourselves with a debugging port, then attach to it.
+
+        Works for any Chromium browser, including the ones Playwright cannot
+        launch (Opera's launcher exits immediately), and runs as its own
+        instance on its own profile, so the user's open browser is untouched."""
+        Path(profile).mkdir(parents=True, exist_ok=True)
+
+        # A window from an earlier run may still be open on this profile. A
+        # second launch would only hand its arguments to that instance (so our
+        # new port never opens) — attach to the port it already has instead.
+        # Chromium writes that port into the profile as DevToolsActivePort.
+        if await self._attach_existing(profile, quick=True):
+            print(f"[Browser] Reusing the {self.browser_name} window already open")
+        else:
+            # Port 0: the browser picks a free port and writes it to
+            # DevToolsActivePort — which is also what lets a later run find it.
+            # (With a fixed port Chromium does not write that file.)
+            try:
+                (Path(profile) / "DevToolsActivePort").unlink()   # stale, from a crash
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"[Browser] could not clear stale DevToolsActivePort: {e}")
+            cmd = [exe, "--remote-debugging-port=0", f"--user-data-dir={profile}",
+                   *args, "about:blank"]
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                if await self._attach_existing(profile):
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                raise RuntimeError(
+                    f"{self.browser_name} started but did not open a debugging port. "
+                    f"If a {self.browser_name} window opened by JARVIS is still open "
+                    f"from before, close it and try again.")
+        ctxs = self._browser.contexts
+        self._context = ctxs[0] if ctxs else await self._browser.new_context(no_viewport=True)
+        self._page = await self._adopt_page()
+        self._watch()
+
+    async def _attach_existing(self, profile: str, quick: bool = False) -> bool:
+        """Attach to a browser already running on `profile` with a debugging
+        port, if there is one. True when attached."""
+        try:
+            first = (Path(profile) / "DevToolsActivePort").read_text().splitlines()[0].strip()
+            port = int(first)
+        except Exception:
+            return False
+        try:
+            self._browser = await self._pw.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{port}", timeout=1500 if quick else 5000)
+            return True
+        except Exception:
+            return False
 
     async def _launch(self):
         """
@@ -572,6 +724,17 @@ class _BrowserSession:
             return
 
         profile = _real_profile_dir(self.browser_name)
+        jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
+        cdp_args = ["--start-maximized", "--no-first-run", "--no-default-browser-check"]
+
+        if self.browser_name in _CDP_ONLY:
+            exe = _chromium_exe(self.browser_name, self._spec)
+            if not exe:
+                raise RuntimeError(f"{_MAC_APP_NAMES.get(self.browser_name, self.browser_name)} "
+                                   f"is not installed (its program could not be found).")
+            await self._launch_over_cdp(exe, jarvis_profile, cdp_args)
+            print(f"[Browser] ✅ Attached to {self.browser_name} @ {exe}")
+            return
 
         kwargs = {
             "headless":    False,
@@ -602,6 +765,7 @@ class _BrowserSession:
         try:
             self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
             self._page = await self._adopt_page()
+            self._watch()
             print(f"[Browser] ✅ Launched [{label}] profile={profile}")
             return
         except Exception as e:
@@ -611,17 +775,30 @@ class _BrowserSession:
         # profile / newer Chrome versions block the real profile under
         # automation). Fall back to a persistent JARVIS automation profile —
         # accounts logged in here once stay logged in on later sessions too.
-        jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
         Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
         print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
 
         try:
             self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
             self._page = await self._adopt_page()
+            self._watch()
             print(f"[Browser] ✅ Launched [{label}] with JARVIS profile "
                   f"(sign-ins persist across sessions)")
+            return
         except Exception as e2:
-            raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
+            print(f"[Browser] ⚠️  JARVIS profile failed for {label}: {e2}")
+            err = e2
+
+        # Last resort: start the browser ourselves and attach over its debugging
+        # port. This is what gets past a Chrome that refuses automation flags.
+        exe2 = _chromium_exe(self.browser_name, self._spec)
+        if not exe2:
+            raise RuntimeError(f"Could not launch {self.browser_name}: {err}")
+        try:
+            await self._launch_over_cdp(exe2, jarvis_profile + "_cdp", cdp_args)
+            print(f"[Browser] ✅ Attached to {self.browser_name} over its debugging port")
+        except Exception as e3:
+            raise RuntimeError(f"Could not launch {self.browser_name}: {e3}") from e3
 
 
     async def _get_page(self) -> Page:
@@ -875,7 +1052,8 @@ class _SessionRegistry:
 
     def get(self, browser_name: str | None = None) -> _BrowserSession:
         if not browser_name:
-            browser_name = self._active_browser or _detect_default_browser()
+            browser_name = (self._active_browser or _preferred_browser()
+                            or _detect_default_browser())
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
         sess = self._get_or_create(browser_name)
         self._active_browser = browser_name
@@ -1063,7 +1241,7 @@ def _log(player, text: str):
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "browser_control",
-    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously.",
+    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Pass the 'browser' parameter ONLY when the user names a browser (e.g. 'open in Edge', 'use Opera'); otherwise omit it and the user's own default browser is used. Multiple browsers can run simultaneously.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
