@@ -84,6 +84,11 @@ For things no other tool does: system settings, installed programs, network info
       confirm=lambda a: f"Bilgisayarında şu komut çalıştırılacak:\n{a.get('command')}",
       label=lambda a: f"Komut: {a.get('command', '')[:60]}")
 def run_command(command: str):
+    low = command.lower()
+    if any(b in low for b in ("msedge", "chrome.exe", "opera", "firefox", "brave", "start-process http",
+                              "start http", "start-process \"http", "start-process 'http")):
+        return ("Not run: websites and browsers are opened with browser_open "
+                "(browser=\"edge\" etc. if the user asked for one).")
     if WIN:
         args = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
                 "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + command]

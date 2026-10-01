@@ -18,8 +18,8 @@ REPO_DIR = Path(__file__).resolve().parent.parent
 
 DEFAULTS: dict = {
     "gemini_api_key": "",
-    # Tried in order; the next one is used when one is rate-limited or down.
-    "models": ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite"],
+    # Tried first, in order; then the newest available Flash models are added.
+    "models": [],               # empty = the newest Flash models your key can use
     "workspace": "",            # empty = Documents/JARVIS
     "browser": "opera",         # opera | operagx | path to any Chromium-based browser
     "browser_path": "",         # set this if Opera is installed somewhere unusual

@@ -5,6 +5,10 @@ Mark-LV'den sadece temel fikirleri aldı; kod sıfırdan yazıldı.
 
 ## Ne yapabilir
 
+- **Ekran görüntüsünden Excel'e:** "Beykoz Riva'daki ilanların ilan no, fiyat ve telefonunu Excel'e aktar" de.
+  Her ilanın ekran görüntüsünü alır, istediğin alanları görüntüden okur ve Excel'e satır olarak ekler.
+  Metni Ctrl+A ile kopyalamaz. Görüntüler Excel'in yanındaki `..._ekran_goruntuleri` klasörüne kaydedilir,
+  aynı ilan iki kez eklenmez.
 - **Web'den veri çekmek:** "sahibinden'de Kadıköy'deki satılık arsaları Excel'e çek" gibi.
   Kendi Opera penceresini açar, sayfadaki tıklanabilir her şeyi numaralar ve numaraya tıklar.
   Bu yüzden "soldaki Arsa'ya tıkla" gibi istekleri gerçekten yapabilir.
@@ -43,9 +47,10 @@ python -m jarvis
 - Çalışırken **Durdur**'a basarak işi kesebilirsin. Yaptığı her adım mesajının altında görünür.
 - **＋** yeni sohbet, **📁** JARVIS'in dosyaları kaydettiği klasör (Belgeler\JARVIS).
 
-## Opera hakkında
+## Tarayıcı
 
-JARVIS kendi Opera penceresini kullanır (ayrı profil). Senin açık Opera'na dokunmaz, başka tarayıcı açmaz,
+JARVIS varsayılan olarak kendi Opera penceresini kullanır (ayrı profil). İstekte "Edge'den", "Chrome'dan"
+dersen o tarayıcının kendi JARVIS penceresini kullanır. Senin açık Opera'na dokunmaz, başka tarayıcı açmaz,
 boş sekme bırakmaz. O pencerede bir siteye giriş yaparsan JARVIS bir dahaki sefere de girişli kalır.
 Opera farklı bir yerde kuruluysa `%USERPROFILE%\.jarvis\config.json` dosyasına
 `{"browser_path": "C:\\...\\opera.exe"}` yaz.
