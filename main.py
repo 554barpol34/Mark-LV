@@ -68,6 +68,7 @@ from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from actions.web_search        import _news as _fetch_news_sync
+from actions                   import agent_task as _agent_task
 from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
@@ -637,6 +638,10 @@ class JarvisLive:
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
+        # Agent mode runs tools from its own thread, through the same registries
+        # the conversation uses, so every confirm gate and undo entry still applies.
+        _agent_task.bind(run_tool=self._agent_run_tool, tools=self._agent_tools)
+
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
         # It is True whenever wake word is OFF, so default behaviour is unchanged.
@@ -775,6 +780,52 @@ class JarvisLive:
             asyncio.run_coroutine_threadsafe(_say(), loop)
         except Exception as e:
             print(f"[PluginSay] {e}")
+
+    # Inline tools agent mode may also use. The rest of the inline set is tied to
+    # the live session (vision, camera, shutdown) and stays with the conversation.
+    _AGENT_INLINE = ("system_status", "recall_memory", "undo", "manage_monitor")
+
+    def _agent_tools(self) -> list[dict]:
+        """Every tool agent mode may plan with: the safe inline ones, then the
+        discovered actions and plugins."""
+        inline = [d for d in TOOL_DECLARATIONS if d["name"] in self._AGENT_INLINE]
+        return (inline + self._action_registry.get_tool_declarations()
+                + self._plugin_registry.get_tool_declarations())
+
+    def _agent_run_tool(self, name: str, args: dict) -> str:
+        """Run one tool for agent mode. Called from the agent's own thread, so
+        it is synchronous and never touches the live session."""
+        args = dict(args or {})
+        if name == "recall_memory":
+            return search_memory(args.get("query", ""), limit=8)
+        if name == "system_status":
+            return str(get_system_status())
+        if name == "undo":
+            if str(args.get("action", "")).lower().strip() == "list":
+                items = undo_stack.history()
+                return ("Things I can undo, most recent first:\n"
+                        + "\n".join(f"{i+1}. {t}" for i, t in enumerate(items))
+                        ) if items else "Nothing can be undone yet."
+            return undo_stack.undo_last()
+        if name == "manage_monitor":
+            action = str(args.get("action", "")).lower().strip()
+            topic  = str(args.get("topic", "")).strip()
+            if action == "add" and topic:
+                return add_monitor(topic)
+            if action == "remove" and topic:
+                return remove_monitor(topic)
+            topics = list_monitors()
+            return ("Monitoring: " + ", ".join(topics)) if topics else "No topics are being monitored."
+        if self._action_registry.has(name):
+            if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
+                args["file_path"] = self.ui.current_file
+            ctx = {"player": self.ui, "speak": self.speak,
+                   "response": None, "session_memory": None}
+            return self._action_registry.run(name, args, ctx) or "Done."
+        if self._plugin_registry.has(name):
+            return self._plugin_registry.run(name, args, player=self.ui,
+                                             session_memory=None) or "Done."
+        return f"Unknown tool: {name}"
 
     def request_reconnect(self, keep_context: bool = True, reason: str = ""):
         """Thread-safe: ask the run loop to tear down and rebuild the Live

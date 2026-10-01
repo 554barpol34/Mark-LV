@@ -53,7 +53,7 @@ It's not just an assistant — it's an extension of your digital life.
 | 🎙️ Voice Picker | Choose from 5 native Gemini voices and switch live from the UI — no restart |
 | ♾️ Unlimited Sessions | Sliding-window context compression — one conversation can last for hours |
 | 🖥️ System Control | Launch apps, adjust volume/brightness, WiFi, shortcuts, power — all by voice |
-| 🧩 Autonomous Tasks | High-level planning for complex multi-step goals via agent mode |
+| 🤖 Agent Mode | Give it a goal, not a command — it plans, uses every other skill, looks at the screen to check its work, and reports back when done |
 | 👁️ Visual Awareness | Screen capture and webcam vision piped into your main Gemini session, labelled by source |
 | 🧠 Persistent Memory | Deeply remembers projects, preferences, and personal context across sessions |
 | ⌨️ Hybrid Input | Seamlessly switch between keyboard typing and voice commands |
@@ -75,6 +75,23 @@ It's not just an assistant — it's an extension of your digital life.
 | ⚡ Auto-Start on Boot | Registers with the OS startup system (registry / LaunchAgent / .desktop) |
 | 📋 Clipboard Intelligence | Copy any text → floating panel with Translate / Summarise / Explain / Fix |
 | 🪪 Assistant Customization | Change the assistant name, your name, voice, and colour from the UI — takes effect immediately |
+
+---
+
+## 🤖 Agent Mode
+
+Most requests are one action: open an app, set the volume, search for something. Agent mode is for the ones that are not — *"find the three cheapest RTX 5070s, put them in a note on my desktop"*, *"clean up my downloads and tell me what you removed"*, *"open Spotify and play my liked songs"*.
+
+JARVIS hands the goal to `actions/agent_task.py`, which works on it in the background while the conversation stays free:
+
+1. **Plan** the next step with Gemini (through the same model ladder as every other side call).
+2. **Act** with any installed tool: actions, plugins, and the safe built-ins. A new plugin is usable by the agent the moment it loads.
+3. **Look** at the screen when it needs to check what happened, then plan again from what it actually sees.
+4. **Report** in one or two sentences when the goal is done, blocked, or needs your input.
+
+Every step appears in the activity log and the step list stays on the content panel. Say **"stop"** at any time to cancel it, or ask how far it is.
+
+It is bounded on purpose: 15 steps by default (40 at most), 15 minutes, one run at a time, and it stops itself if it repeats the same step three times. It acts only through the existing tools, so their safety still holds: irreversible actions wait for **CONFIRM** on the HUD, file and settings changes can be undone, and sending a message on your behalf always waits for your CONFIRM first.
 
 ---
 
